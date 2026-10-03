@@ -261,6 +261,8 @@ class PolymarketSurface:
             # them. The one that died may have sent a whole allowance in the 10 s before
             # it did, so a resumed pot counts its allowance as spent at the resume.
             self.venue.target.budget.spend_all()
+            # So does its Polygon reader (Sol P2, round 5 of #180).
+            self.venue.target.chain.budget.spend_all()
         if saved.get("venue") is not None and self.venue.deterministic:
             self.venue.target.__dict__.clear()
             self.venue.target.__dict__.update(saved["venue"])
@@ -1176,7 +1178,7 @@ def refusal(rt: Any, surface: PolymarketSurface, seat: str | None, handle: str,
         return "order notional exceeds [polymarket] max_order_usd"
     if surface.contradicted:
         return MAKER_ONLY_REFUSAL
-    if surface.live and surface.drifting:
+    if surface.live and (surface.drifting or _owes_chain(surface)):
         return DRIFT_REFUSAL
     cap = spec.principal_micro
     if cap is not None and usd_to_micro(
@@ -1197,6 +1199,13 @@ def refusal(rt: Any, surface: PolymarketSurface, seat: str | None, handle: str,
     if notional + committed > available:
         return "order collateral exceeds the polymarket pot's available USDC"
     return None
+
+
+def _owes_chain(surface: PolymarketSurface) -> bool:
+    """Whether any Polygon check is owed (``polymarket_clob.OWED``; issue #180)."""
+    from factorylab.world.polymarket_clob import owed_checks
+
+    return bool(owed_checks(surface.cursor))
 
 
 #: A fill whose fee its trade did not state: its amount is not established.
@@ -1606,6 +1615,10 @@ def tick(rt: Any) -> None:
         else:
             _halt_on_contradiction(rt, surface, answer.get("contradictions") or {})
             _ledger_malformed(rt, surface, answer.get("malformed") or [])
+            # A Polygon check the poll owes is in its cursor (``OWED``): buying waits.
+            if answer.get("chain_unread"):
+                rt.ledger.append({"kind": "polymarket.chain_unavailable",
+                                  "reason": CHAIN_UNREAD, "ts": rt.clock.now_ns})
             surface.cursor = answer["cursor"]
             settle(rt, answer["events"])
             if answer.get("complete"):
@@ -2020,16 +2033,76 @@ def reconcile(rt: Any) -> dict[str, Any] | None:
             str(opened.get(t, "0"))) + book.get(t, Decimal(0)))
         if missing:
             result["tokens"] = missing[:20]
-    unexplained = abs(drift) > Decimal("0.000001") or "tokens" in result
+    if surface.live:
+        from factorylab.world.polymarket_clob import owed_checks
+
+        _on_chain(rt, surface, account, listed, result)
+        owed = owed_checks(surface.cursor)
+        if owed:
+            # Every Polygon check owed (issue #180): the pot is not reconciled.
+            result["owed"] = owed[:20]
+    unexplained = (abs(drift) > Decimal("0.000001") or "tokens" in result
+                   or "chain" in result or "owed" in result)
     if unexplained:
         rt.ledger.append({"kind": "polymarket.drift", **result, "ts": rt.clock.now_ns})
     # Astra P1 on #177: money the books do not explain, gone or arrived, leaves the
     # pot's reconciliation unknown, and new exposure waits on it (architect's decision
     # on Sol's round-7 review: unexplained money in either direction means the books
     # are wrong). No allowance is made (Sol P1: a blanket one hid real losses); a drift
-    # is never booked as a fee (Codex P1).
+    # is never booked as a fee (Codex P1). A pot the chain did not confirm is not
+    # reconciled either (issue #180): new risk waits on it, fail closed.
     surface.drifting = unexplained
     return result
+
+
+#: Six-decimal units of pUSD and of outcome tokens.
+UNITS = Decimal(1_000_000)
+#: Why a ``polymarket.chain_unavailable`` row is written, whatever failed: a replay
+#: reconstructs a recorded failure under another type, and the row must be the run's.
+CHAIN_UNREAD = "the pot was not read on Polygon"
+
+
+def _on_chain(rt: Any, surface: PolymarketSurface, account: dict,
+              listed: dict[str, Decimal], result: dict[str, Any]) -> None:
+    """Check the custodian's listing against Polygon: the ``account`` check, owed until
+    it is answered and agrees (``polymarket_clob.chain_check``).
+
+    Issue #180: the reconciliation above holds the books to Polymarket's APIs, and an
+    answer they give wrong the same way everywhere would hold too. So the pUSD balance
+    and every token the pot lists, opened with, holds on its books or keeps resolved
+    and unredeemed are read from the chain at its finalized head (``chain_account``,
+    journaled, so a replay reads what the run read), and each must equal the listing
+    exactly (a token the listing omits holds 0). A difference is put in ``result``
+    under ``chain``. A chain that did not answer, or answered for other tokens, is
+    ledgered ``polymarket.chain_unavailable``. Either way the check stays owed and
+    buying waits until a reconciliation's read agrees.
+    """
+    from factorylab.world.polymarket_clob import ACCOUNT_CHECK, chain_check, owe, settle
+
+    cursor = surface.cursor
+    opened = ((cursor.get("bound") or {}).get("opening") or {}).get("tokens") or {}
+    tokens = sorted(set(listed) | set(opened) | set(cursor.get("redeemable", {}))
+                    | {t for t, (size, _avg) in cursor.get("book", {}).items()
+                       if Decimal(str(size)) > 0})
+    try:
+        chain = chain_check(ACCOUNT_CHECK,
+                            lambda: surface.venue.chain_account(tokens=tokens))
+        usdc = Decimal(int(chain["usdc"])) / UNITS
+        held = {str(t): Decimal(int(units)) / UNITS for t, units in chain["tokens"].items()}
+        if set(held) != set(tokens):
+            raise ValueError("the chain did not answer the tokens asked")
+    except Exception:  # noqa: BLE001 - an unread chain confirms nothing
+        rt.ledger.append({"kind": "polymarket.chain_unavailable",
+                          "reason": CHAIN_UNREAD, "ts": rt.clock.now_ns})
+        owe(surface.cursor, ACCOUNT_CHECK)
+        return
+    differs = sorted(t for t in tokens if listed.get(t, Decimal(0)) != held[t])
+    if usdc != Decimal(str(account["usdc"])) or differs:
+        result["chain"] = {"block": chain["block"], "usdc": str(usdc),
+                           "tokens": differs[:20]}
+        owe(surface.cursor, ACCOUNT_CHECK)
+    else:
+        settle(surface.cursor, ACCOUNT_CHECK)
 
 
 #: A resolved token's book stream watermark: no book fact can follow a resolution.
