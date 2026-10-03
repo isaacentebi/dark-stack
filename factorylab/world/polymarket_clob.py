@@ -406,6 +406,54 @@ class ChainOwed(wire.Malformed):
     it (Sol P0, round 2 of #180)."""
 
 
+# --- the Polygon checks the pot owes (issue #180) --------------------------------------
+#
+# One ledger for every check of the pot against Polygon, so no check keeps its own
+# bookkeeping (Sol's rounds 1 to 5 each found one check that lacked another's). It is a
+# list of check keys in the poll cursor (``OWED``), so it is journaled with the poll,
+# checkpointed, restored and replayed with it, and kept across a step's rollback and the
+# rotation of market reads. A check is owed from the moment it is asked until it is
+# answered and agrees: one that did not answer, could not be asked, or disagrees stays
+# owed. While any is owed, no buy is taken (``runtime/polymarket.py``, ``refusal``).
+# The keys: ``account`` (the pot's balances, every reconciliation), ``payout:<token>``
+# (the token's proof and its payout, at a resolution Gamma states) and
+# ``holds:<token>`` (what the chain holds of a resolved token before it is paid).
+
+#: Where the owed checks live in the poll cursor.
+OWED = "chain_owed"
+#: The reconciliation's check of the pot's pUSD and token balances.
+ACCOUNT_CHECK = "account"
+
+
+def owed_checks(cursor: dict[str, Any] | None) -> list[str]:
+    """The Polygon checks the pot owes, sorted."""
+    return sorted((cursor or {}).get(OWED) or [])
+
+
+def owe(cursor: dict[str, Any], key: str) -> None:
+    """Record ``key`` as owed: asked and not yet answered in agreement."""
+    cursor[OWED] = sorted({*owed_checks(cursor), key})
+
+
+def settle(cursor: dict[str, Any], key: str) -> None:
+    """Record ``key`` as answered in agreement."""
+    cursor[OWED] = [k for k in owed_checks(cursor) if k != key]
+
+
+def chain_check(key: str, read: Any, *args: Any) -> Any:
+    """``read(*args)``, one Polygon check under ``key``.
+
+    Guarantees any failure of the check, whatever it is (an unread chain, a question
+    that cannot be asked, a malformed answer), leaves with ``key`` as its ``owed``, so the
+    caller that rolls the step back still records the check as owed (``poll``).
+    """
+    try:
+        return read(*args)
+    except Exception as exc:
+        exc.owed = key
+        raise
+
+
 class Withheld(Exception):
     """A signed order not sent: its slot had left the budget's window at the transport,
     and no slot was left to renew it. It never reached the venue."""
@@ -867,7 +915,8 @@ class LivePolymarket(PolymarketReader):
              orders: dict[str, dict[str, str]], own: Any = None) -> dict[str, Any]:
         """The pot's fills and resolutions since ``cursor``: ``{events, cursor,
         contradictions, malformed, complete, chain_unread}`` (``malformed``: why a read
-        was unread; ``chain_unread``: a check Polygon owed was not read).
+        was unread; ``chain_unread``: a Polygon check failed this poll, and is owed in
+        the cursor, ``OWED``).
 
         Guarantees each fill of one of ``orders`` (this world's orders, as their intents
         name them) is reported exactly once, when its trade is CONFIRMED, in the shape
@@ -903,8 +952,6 @@ class LivePolymarket(PolymarketReader):
         # durable intents, uncertain ones included; Sol P1, rounds 8 and 9), never only
         # the orders it settles, and trades are read while any of them may still fill.
         own = dict(own or {})
-        from factorylab.world.polygon_ctf import ChainUnread
-
         chain_unread = False
         for step in (lambda trial: self._fills(trial, orders, contradictions, own),
                      lambda trial: self._resolutions(trial, orders, now_ns, contradictions)):
@@ -919,15 +966,12 @@ class LivePolymarket(PolymarketReader):
                 complete = False
                 if isinstance(exc, wire.Malformed):
                     malformed.append(str(exc))
-                # A check Polygon did not answer is owed: buying waits on it (Sol P0,
-                # round 1 of #180), not only the payout. A payout check stays owed, in
-                # the cursor, until that token's own check is answered, however the
-                # rotation moves meanwhile (Sol P0, round 4).
-                chain_unread = chain_unread or isinstance(exc, (ChainUnread, ChainOwed))
+                # A Polygon check that failed is owed in the committed cursor, whatever
+                # the rollback discards (``chain_check``; Sol P0, rounds 1 to 5 of #180).
                 owed = getattr(exc, "owed", None)
-                if chain_unread and owed is not None:
-                    state["chain_pending"] = sorted(
-                        {*state.get("chain_pending", []), owed})
+                if owed is not None:
+                    owe(state, owed)
+                    chain_unread = True
                 continue
             state = trial
             events.extend(found)
@@ -1111,11 +1155,11 @@ class LivePolymarket(PolymarketReader):
                             if t not in state["resolved"] and markets.get(t))
         events: list[dict[str, Any]] = []
         facts = state.setdefault("resolution_facts", {})
-        # Tokens Gamma states resolved and Polygon has not yet reported (Sol P0, round 3
-        # of #180): a disagreement of the API with the chain, durable across the
-        # rotation, kept while the pot holds or may hold the token; buying waits on it.
-        pending = state["chain_pending"] = sorted(
-            t for t in state.get("chain_pending", []) if t in candidates)
+        # A token's owed checks are kept while the pot holds or may hold it, or holds it
+        # resolved and unpaid; a token it can no longer hold owes nothing more.
+        scope = set(candidates) | {t for t in state["resolved"] if t in held}
+        state[OWED] = [k for k in owed_checks(state)
+                       if ":" not in k or k.split(":", 1)[1] in scope]
 
         if candidates:
             # One market read a poll, in turn: what the pot holds or has resting.
@@ -1132,30 +1176,22 @@ class LivePolymarket(PolymarketReader):
             paid = payout(market, token)
             claimed = paid is not None
             outcome = next(o for o in market["outcomes"] if o["token_id"] == token)
+            check = f"payout:{token}"
             if paid is not None:
                 # Issue #180: Gamma's payout is paid only once Polygon reports the same
-                # one; a disagreement halts buying and pays nothing, and a payout the
-                # chain has not yet reported waits (a chain that did not answer leaves
-                # this step unread).
-                try:
-                    reported, reason = self._chain_payout(state["bound"], token, market,
-                                                          outcome["outcome_index"], paid)
-                except (ChainOwed, PolymarketUnavailable) as exc:
-                    # The check stays owed beyond this rolled-back step (Sol P0, round 4
-                    # of #180): ``poll`` keeps the token pending in the committed cursor.
-                    exc.owed = token
-                    raise
+                # one; a disagreement halts buying and pays nothing; a payout the chain
+                # has not yet reported, or a check it did not answer, stays owed.
+                reported, reason = chain_check(check, self._chain_payout, state["bound"],
+                                               token, market, outcome["outcome_index"], paid)
                 if reason:
                     contradictions[f"{token}:chain"] = reason
                     return events
                 if not reported:
                     paid = None
-                    if token not in pending:
-                        pending.append(token)
-                        pending.sort()
-            if (paid is not None or not claimed) and token in pending:
+                    owe(state, check)
+            if paid is not None or not claimed:
                 # Confirmed on chain, or Gamma no longer states it: nothing is owed.
-                pending.remove(token)
+                settle(state, check)
             if paid is not None:
                 state["resolved"][token] = str(paid)
                 facts[token] = {"market_id": markets[token],
@@ -1169,13 +1205,19 @@ class LivePolymarket(PolymarketReader):
         # and unredeemed, the whole quantity paid, or it waits for a later poll.
         for token, paid in sorted(state["resolved"].items()):
             size, avg = (_dec(v) for v in state["book"].get(token, ("0", "0")))
-            if size > 0 and token in facts and self._chain_holds(state, token, size):
-                state["book"][token] = ["0", str(avg)]
-                _redeemable(state, token, size)
-                events.append({**facts[token], "kind": "resolution", "token_id": token,
-                               "payout": str(paid), "size": str(size),
-                               "realized_usd": str((_dec(paid) - avg) * size),
-                               "ts_ns": now_ns})
+            if size <= 0 or token not in facts:
+                continue
+            check = f"holds:{token}"
+            if not chain_check(check, self._chain_holds, state, token, size):
+                owe(state, check)  # the chain holds less: unpaid, and owed
+                continue
+            settle(state, check)
+            state["book"][token] = ["0", str(avg)]
+            _redeemable(state, token, size)
+            events.append({**facts[token], "kind": "resolution", "token_id": token,
+                           "payout": str(paid), "size": str(size),
+                           "realized_usd": str((_dec(paid) - avg) * size),
+                           "ts_ns": now_ns})
         # A resolution cancels what rests on the market (CANCELED_MARKET_RESOLVED): each
         # of this world's orders on a resolved token is read back, two a poll, until the
         # venue says it is terminal AND every quantity it matched is booked from a

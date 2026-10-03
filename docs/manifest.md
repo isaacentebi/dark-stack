@@ -2851,42 +2851,51 @@ The order path, as the Hyperliquid one (`VenueMixin._venue_write`):
   `eth_chainId` (it must be 137), `eth_getBlockByNumber("finalized")` and `eth_call`
   to the Conditional Tokens and pUSD, every read of one observation pinned to that one
   finalized block. It holds no key and can move nothing.
+  * *Owed checks.* Every check below is one key in one ledger, the poll cursor's
+    `chain_owed` (`polymarket_clob.OWED`): `account` (the balances), `payout:<token>`
+    (a token's proof and payout) and `holds:<token>` (what the chain holds of a
+    resolved token before it is paid). A check is owed from the moment it is asked
+    until it is answered and agrees: one that did not answer, could not be asked, or
+    disagrees stays owed, kept through a step's rollback, the rotation of market reads,
+    a checkpoint and a resume, since the cursor is journaled and checkpointed with the
+    poll; a token's checks lapse only when the pot can no longer hold it. While any
+    check is owed, no buy is taken (the drift refusal), and each reconciliation ledgers
+    `polymarket.drift` with `owed`, the keys.
   * *Balances.* Every reconciliation reads, at the finalized head, the funder's pUSD
     and its balance of every token the pot lists, opened with, holds on its books or
     keeps resolved and unredeemed (`chain_account`, journaled: a replay reads what the
     run read). The listing must equal the chain exactly (a token the listing omits
     holds 0). A difference is drift (`polymarket.drift` with `chain`: the block, the
-    chain's pUSD and the tokens that differ): buying waits until they agree. With the
+    chain's pUSD and the tokens that differ) and `account` is owed until they agree. With the
     books already held to the listing, the books are held to the chain. A fill, a
     deposit and a redemption are each checked this way, in aggregate: the pot's value
     and its token counts on chain.
   * *Fail closed.* A chain that does not answer, answers another chain, answers for
     other tokens, or answers anything but a canonical JSON-RPC result (an error, a
     word of the wrong length, another request's id) is unread, never a zero:
-    `polymarket.chain_unavailable` ("the pot was not read on Polygon") and buying
-    waits. The pot's own requests to the endpoint are at most
+    `polymarket.chain_unavailable` ("the pot was not read on Polygon") and its check is
+    owed. The pot's own requests to the endpoint are at most
     `CHAIN_REQUESTS_PER_10S` (30) in any sliding 10 s of wall time, each counted
     before it is sent (the endpoint publishes no limit; a tick sends two
     reconciliations' 4 each, one resolution check's 7, and 4 for each resolved token
     whose payout is being paid); one
-    past it is not sent and the read is unread.
+    past it is not sent and the read is unread. A resumed pot counts that whole
+    allowance as sent at the resume, as it does the CLOB's.
   * *Resolutions.* A payout Gamma states is paid only once the chain states the same
     one: the token is first proven, on chain, to be the position of the market's
     condition at its outcome index for the market's collateral (the proof binds the
     token to that condition, index and kind forever), and the condition's payout
     vector binds at its first report. A resolution Gamma states and the chain has not
-    reported is a disagreement: nothing is paid, `polymarket.drift` ("a resolution
-    Polygon has not reported") is ledgered each tick, and buying waits until the chain
-    reports it or Gamma no longer states it (held across the rotation of market reads,
-    while the pot holds or may hold the token); a payout check the chain did not
-    answer, or that cannot be asked (a malformed condition id), keeps its token pending
-    the same way, in the journaled cursor, until that token's own check is answered; a token the condition does not issue, a condition
-    other than the one bound, or a payout other than `numerator / denominator` exactly
-    halts buying for the world's life and pays nothing. What is paid is only what the
-    chain holds: the payout of the tokens the books hold waits until the chain holds, of
-    that token, what the pot opened with, what it keeps resolved and unredeemed, and
-    the books' quantity (a token the operator redeemed before a late fill of it was
-    booked leaves that fill unpaid).
+    reported, or one whose check the chain did not answer or that cannot be asked (a
+    malformed condition id), pays nothing and its `payout:<token>` is owed until the
+    chain reports it or Gamma no longer states it. A token the condition does not
+    issue, a condition other than the one bound, or a payout other than
+    `numerator / denominator` exactly halts buying for the world's life and pays
+    nothing. What is paid is only what the chain holds: the payout of the tokens the
+    books hold waits, its `holds:<token>` owed, until the chain holds, of that token,
+    what the pot opened with, what it keeps resolved and unredeemed, and the books'
+    quantity (a token the operator redeemed before a late fill of it was booked leaves
+    that fill unpaid, and its check owed).
   * *Endpoint.* `POLYGON_RPC_URL` (environment, or `.env` in the run directory) names
     the endpoint, an https URL with no credentials in its authority; unset, it is
     `https://polygon-bor-rpc.publicnode.com` (`polygon-rpc.com`, the endpoint Polygon

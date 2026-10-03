@@ -20,6 +20,7 @@ from factorylab.runtime.resume import JournalProxy, RecoveryJournal
 from factorylab.runtime.worlds import PolymarketSpec, load_manifest
 from factorylab.world import polygon_ctf
 from factorylab.world import polymarket_clob as clob
+from factorylab.world.polymarket_clob import owed_checks
 from tests.helpers import collateral_decision
 from tests.runtime.test_polymarket_live import buy, items, live_world, maker_fill, token
 from tests.runtime.test_polymarket_surface import still_fake
@@ -208,8 +209,9 @@ def test_a_resolution_polygon_has_not_reported_waits_and_is_paid_once_it_does():
     polymarket.tick(rt)
     assert not items(rt, "polymarket.resolution") and not rt.polymarket.contradicted
     assert token(server) not in rt.polymarket.cursor.get("resolved", {})
-    assert rt.polymarket.drifting and rt.polymarket.cursor["chain_pending"] == [token(server)]
-    assert any(row.get("reason") == "a resolution Polygon has not reported"
+    assert rt.polymarket.drifting
+    assert owed_checks(rt.polymarket.cursor) == [f"payout:{token(server)}"]
+    assert any(row.get("owed") == [f"payout:{token(server)}"]
                for row in items(rt, "polymarket.drift"))
     refused = buy(rt, server, collateral_decision(rt), market="fake-2", price="0.20")
     assert refused["error"] == polymarket.DRIFT_REFUSAL
@@ -217,7 +219,7 @@ def test_a_resolution_polygon_has_not_reported_waits_and_is_paid_once_it_does():
     polymarket.tick(rt)
     (row,) = items(rt, "polymarket.resolution")
     assert row["payout"] == "1"
-    assert rt.polymarket.cursor["chain_pending"] == [] and not rt.polymarket.drifting
+    assert owed_checks(rt.polymarket.cursor) == [] and not rt.polymarket.drifting
     placed = buy(rt, server, collateral_decision(rt), market="fake-2", price="0.20",
                  slot="tool:1")
     assert placed["status"] == "resting"
@@ -229,7 +231,7 @@ def test_an_unconfirmed_resolution_holds_buying_across_the_rotation():
     rt, server = resolved_world()
     server.chain_lag.add("fake-1")
     buy(rt, server, collateral_decision(rt), market="fake-2", price="0.10")  # rests
-    tick_until(rt, lambda: rt.polymarket.cursor.get("chain_pending"))  # fake-1 is read
+    tick_until(rt, lambda: owed_checks(rt.polymarket.cursor))  # fake-1 is read
     for _ in range(4):  # it reads fake-2 and fake-1 in turn from here on
         polymarket.tick(rt)
         assert rt.polymarket.drifting
@@ -381,7 +383,7 @@ def test_a_failed_payout_check_stays_owed_however_the_rotation_moves():
 
     server._eth_call = flaky
     # Until the rotation first reads fake-1's payout.
-    tick_until(rt, lambda: token(server) in rt.polymarket.cursor.get("chain_pending", []))
+    tick_until(rt, lambda: f"payout:{token(server)}" in owed_checks(rt.polymarket.cursor))
     reads = len([c for c in server.calls if c[1].startswith("/markets/")])
     # A candidate leaving the rotation shifts every later index (Sol's reproduction): the
     # next polls read the other markets, not fake-1.
@@ -389,15 +391,116 @@ def test_a_failed_payout_check_stays_owed_however_the_rotation_moves():
     for _ in range(2):
         polymarket.tick(rt)
         assert rt.polymarket.drifting
-        assert token(server) in rt.polymarket.state()["cursor"]["chain_pending"]
+        assert f"payout:{token(server)}" in owed_checks(rt.polymarket.state()["cursor"])
     later = [c[1] for c in server.calls if c[1].startswith("/markets/")][reads:]
     assert {"/markets/fake-2", "/markets/fake-3"} <= set(later)
     assert not items(rt, "polymarket.resolution")
     server._eth_call = real
     tick_until(rt, lambda: items(rt, "polymarket.resolution"))
-    assert rt.polymarket.cursor["chain_pending"] == []
+    assert owed_checks(rt.polymarket.cursor) == []
     polymarket.tick(rt)
     assert not rt.polymarket.drifting
+
+
+# --- every Polygon check, one mechanism (Sol's round-5 review of #180) ---------------------
+
+BALANCE_OF = keccak(text="balanceOf(address)")[:4]
+BATCH = keccak(text="balanceOfBatch(address[],uint256[])")[:4]
+DENOMINATOR = keccak(text="payoutDenominator(bytes32)")[:4]
+POSITION = keccak(text="getPositionId(address,bytes32)")[:4]
+
+
+def _singleton_of(server):
+    """A balance read of fake-1's token alone: the holdings check of its resolution (the
+    reconciliation asks for every token at once)."""
+    from eth_abi import decode
+
+    def check(data):
+        if data[:4] != BATCH:
+            return False
+        _owners, ids = decode(["address[]", "uint256[]"], data[4:])
+        return list(ids) == [int(token(server))]
+    return check
+
+
+#: Each Polygon check the pot makes, failed alone: (its owed key, a predicate on the
+#: eth_call it fails, or None for a check that cannot be asked).
+CHECKS = {
+    "account": lambda server: ("account", lambda data: data[:4] == BALANCE_OF),
+    "payout": lambda server: (f"payout:{token(server)}",
+                              lambda data: data[:4] == DENOMINATOR),
+    "proof": lambda server: (f"payout:{token(server)}",
+                             lambda data: data[:4] == POSITION),
+    "condition": lambda server: (f"payout:{token(server)}", None),
+    "holds": lambda server: (f"holds:{token(server)}", _singleton_of(server)),
+}
+
+
+def held_world():
+    """Sol's round-5 reproduction: fake-1 and fake-2 filled, fake-3 resting, fake-1
+    resolved YES on Gamma and on chain."""
+    fake = still_fake(resolutions={"fake-1": (10**15, 0)})
+    rt, server = live_world(fake=fake)
+    maker_fill(rt, server, collateral_decision(rt), price="0.40", market="fake-1")
+    maker_fill(rt, server, collateral_decision(rt), price="0.40", market="fake-2")
+    buy(rt, server, collateral_decision(rt), market="fake-3", price="0.10")
+    polymarket.tick(rt)
+    rt.clock.now_ns = 10**15
+    server.advance(10**15)
+    return rt, server
+
+
+@pytest.mark.parametrize("kind", sorted(CHECKS))
+def test_no_buy_is_taken_while_any_polygon_check_is_owed(kind):
+    """Owner's rule after Sol's round 5: every check of the pot against Polygon, failed
+    alone, is owed in the journaled cursor until that check itself is answered,
+    however the rotation moves and across a checkpoint and resume; no buy is taken
+    meanwhile, and buying resumes once it is answered."""
+    rt, server = held_world()
+    key, fails = CHECKS[kind](server)
+    real = server._eth_call
+
+    def failing(to, data):
+        if fails is not None and fails(data):
+            raise clob.PolymarketUnavailable("transport: TimeoutError")
+        return real(to, data)
+
+    server._eth_call = failing
+    if fails is None:
+        server.market_row = lambda row: (
+            {**row, "conditionId": None} if row["id"] == "fake-1" else row)
+    tick_until(rt, lambda: key in owed_checks(rt.polymarket.cursor), ticks=12)
+    rt.polymarket.cursor["turn"] += 1  # the rotation shifts (Sol's reproduction)
+    for _ in range(2):
+        polymarket.tick(rt)
+    rt.polymarket.restore(rt.polymarket.state())  # a checkpoint and resume
+    for _ in range(2):
+        polymarket.tick(rt)
+        assert key in owed_checks(rt.polymarket.state()["cursor"])
+    refused = buy(rt, server, collateral_decision(rt), market="fake-2", price="0.05",
+                  slot="tool:1")
+    assert refused["status"] == "rejected" and refused["error"] == polymarket.DRIFT_REFUSAL
+    assert not items(rt, "polymarket.resolution") or kind == "account"
+    server._eth_call, server.market_row = real, None
+    tick_until(rt, lambda: not owed_checks(rt.polymarket.cursor), ticks=40)
+    polymarket.tick(rt)
+    assert [row["size"] for row in items(rt, "polymarket.resolution")] == ["10"]
+    placed = buy(rt, server, collateral_decision(rt), market="fake-2", price="0.05",
+                 slot="tool:2")
+    assert placed["status"] == "resting"
+
+
+def test_a_resume_counts_the_polygon_allowance_as_spent():
+    """Sol P2, round 5: a resumed pot's Polygon reader started with an empty window, so
+    a world resumed within 10 s could send a second allowance."""
+    rt, server = live_world(wall=lambda: 1_790_000_000_000_000_000)
+    chain = rt.polymarket.venue.target.chain
+    chain.budget.wall = lambda: 1_790_000_000_000_000_000
+    rt.polymarket.restore(rt.polymarket.state())
+    sent = len(server.chain_calls)
+    with pytest.raises(polygon_ctf.ChainUnread, match="budget"):
+        chain.account("0x" + "ab" * 20, [])
+    assert len(server.chain_calls) == sent
 
 
 def test_the_installed_live_venue_reads_polygon(monkeypatch):
