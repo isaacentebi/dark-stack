@@ -967,11 +967,15 @@ class LivePolymarket(PolymarketReader):
                 if isinstance(exc, wire.Malformed):
                     malformed.append(str(exc))
                 # A Polygon check that failed is owed in the committed cursor, whatever
-                # the rollback discards (``chain_check``; Sol P0, rounds 1 to 5 of #180).
+                # the rollback discards (``chain_check``; Sol P0, rounds 1 to 5 of #180),
+                # and so is every debt the step incurred before it failed; its
+                # settlements are discarded with it (Sol P0, round 6).
                 owed = getattr(exc, "owed", None)
                 if owed is not None:
                     owe(state, owed)
                     chain_unread = True
+                for key in sorted(set(owed_checks(trial)) - set(owed_checks(state))):
+                    owe(state, key)
                 continue
             state = trial
             events.extend(found)
@@ -1177,21 +1181,22 @@ class LivePolymarket(PolymarketReader):
             claimed = paid is not None
             outcome = next(o for o in market["outcomes"] if o["token_id"] == token)
             check = f"payout:{token}"
-            if paid is not None:
+            if claimed or check in owed_checks(state):
                 # Issue #180: Gamma's payout is paid only once Polygon reports the same
-                # one; a disagreement halts buying and pays nothing; a payout the chain
-                # has not yet reported, or a check it did not answer, stays owed.
-                reported, reason = chain_check(check, self._chain_payout, state["bound"],
-                                               token, market, outcome["outcome_index"], paid)
+                # one; a disagreement halts buying and pays nothing. A check is settled
+                # only when the chain's answer agrees with Gamma's: the same payout, or,
+                # once Gamma no longer states one, none on chain either (Sol P0, round 6:
+                # a retraction cleared a debt no chain read had answered).
+                agrees, reason = chain_check(check, self._chain_payout, state["bound"],
+                                             token, market, outcome["outcome_index"], paid)
                 if reason:
                     contradictions[f"{token}:chain"] = reason
                     return events
-                if not reported:
+                if agrees:
+                    settle(state, check)
+                else:
                     paid = None
                     owe(state, check)
-            if paid is not None or not claimed:
-                # Confirmed on chain, or Gamma no longer states it: nothing is owed.
-                settle(state, check)
             if paid is not None:
                 state["resolved"][token] = str(paid)
                 facts[token] = {"market_id": markets[token],
@@ -1265,8 +1270,10 @@ class LivePolymarket(PolymarketReader):
         return Decimal(units) / UNIT >= _dec(opened.get(token, "0")) + kept + size
 
     def _chain_payout(self, bound: dict, token: str, market: dict[str, Any], index: int,
-                      paid: Decimal) -> tuple[bool, str | None]:
-        """(whether Polygon reports this resolution, why it contradicts it or None).
+                      paid: Decimal | None) -> tuple[bool, str | None]:
+        """(whether Polygon's answer agrees with Gamma's ``paid``, why it contradicts it
+        or None). ``paid`` None: Gamma states no payout, which agrees only with a
+        condition the chain has not reported.
 
         Guarantees a payout Gamma states is confirmed by the Conditional Tokens contract
         at a finalized block before it is paid (issue #180): the token is first proven,
@@ -1291,11 +1298,13 @@ class LivePolymarket(PolymarketReader):
         denominator = int(read["denominator"])
         numerators = [int(n) for n in read["numerators"]]
         if denominator == 0:
-            return False, None
+            return paid is None, None
         reason = wire.bind(bound, "payout", condition,
                            [str(denominator), *(str(n) for n in numerators)])
         if reason:
             return False, reason
+        if paid is None:
+            return False, None  # the chain reports a payout Gamma does not state
         if Decimal(numerators[index]) / Decimal(denominator) != paid:
             return False, "a resolution's payout disagrees with Polygon's"
         return True, None

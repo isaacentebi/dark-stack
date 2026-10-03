@@ -2856,7 +2856,8 @@ The order path, as the Hyperliquid one (`VenueMixin._venue_write`):
     (a token's proof and payout) and `holds:<token>` (what the chain holds of a
     resolved token before it is paid). A check is owed from the moment it is asked
     until it is answered and agrees: one that did not answer, could not be asked, or
-    disagrees stays owed, kept through a step's rollback, the rotation of market reads,
+    disagrees stays owed, kept through a step's rollback (every debt the step incurred
+    is kept, none of its settlements), the rotation of market reads,
     a checkpoint and a resume, since the cursor is journaled and checkpointed with the
     poll; a token's checks lapse only when the pot can no longer hold it. While any
     check is owed, no buy is taken (the drift refusal), and each reconciliation ledgers
@@ -2888,7 +2889,8 @@ The order path, as the Hyperliquid one (`VenueMixin._venue_write`):
     vector binds at its first report. A resolution Gamma states and the chain has not
     reported, or one whose check the chain did not answer or that cannot be asked (a
     malformed condition id), pays nothing and its `payout:<token>` is owed until the
-    chain reports it or Gamma no longer states it. A token the condition does not
+    chain's answer agrees with Gamma's: the same payout, or, once Gamma no longer states
+    one, none reported on chain either. A token the condition does not
     issue, a condition other than the one bound, or a payout other than
     `numerator / denominator` exactly halts buying for the world's life and pays
     nothing. What is paid is only what the chain holds: the payout of the tokens the

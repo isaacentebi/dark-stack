@@ -490,6 +490,69 @@ def test_no_buy_is_taken_while_any_polygon_check_is_owed(kind):
     assert placed["status"] == "resting"
 
 
+def test_a_retracted_resolution_settles_its_check_only_when_the_chain_agrees():
+    """Sol P0, round 6: Gamma no longer stating a resolution cleared the payout check it
+    owed with no chain read; the debt stays until the chain reports no payout either."""
+    rt, server = held_world()
+    key = f"payout:{token(server)}"
+    real = server._eth_call
+    server._eth_call = lambda to, data: (
+        (_ for _ in ()).throw(clob.PolymarketUnavailable("down"))
+        if data[:4] == DENOMINATOR else real(to, data))
+    tick_until(rt, lambda: key in owed_checks(rt.polymarket.cursor), ticks=12)
+    retract = lambda row: ({**row, "closed": False, "umaResolutionStatus": None}  # noqa: E731
+                           if row["id"] == "fake-1" else row)
+    server.market_row = retract
+    for _ in range(4):  # Gamma retracted, the chain still unread
+        polymarket.tick(rt)
+        assert key in owed_checks(rt.polymarket.cursor)
+    server._eth_call = real  # the chain answers: resolved, which Gamma no longer states
+    for _ in range(4):
+        polymarket.tick(rt)
+        assert key in owed_checks(rt.polymarket.cursor)
+    refused = buy(rt, server, collateral_decision(rt), market="fake-2", price="0.05",
+                  slot="tool:1")
+    assert refused["error"] == polymarket.DRIFT_REFUSAL
+    server.chain_lag.add("fake-1")  # the chain agrees: no payout on chain either
+    tick_until(rt, lambda: key not in owed_checks(rt.polymarket.cursor), ticks=12)
+    assert not items(rt, "polymarket.resolution")
+
+
+@pytest.mark.parametrize("disagree", ["unreported", "holds_less"])
+def test_a_debt_incurred_before_a_later_failure_survives_the_rollback(disagree):
+    """Sol P0, round 6: the rollback kept only the failing check's key, so a payout the
+    chain had not reported (or a holding it answered short), owed earlier in the same
+    step, was lost when a later read of that step failed."""
+    rt, server = held_world()
+    if disagree == "unreported":
+        server.chain_lag.add("fake-1")
+        key = f"payout:{token(server)}"
+    else:
+        server.chain_tokens[token(server)] = Decimal(7)
+        key = f"holds:{token(server)}"
+    venue = rt.polymarket.venue.target
+    real = venue._resolutions
+
+    def then_fails(*args):
+        real(*args)
+        raise clob.PolymarketUnavailable("a later read of the same step failed")
+
+    venue._resolutions = then_fails
+    for _ in range(6):  # a rolled-back step does not advance the rotation: step it here
+        polymarket.tick(rt)
+        if key in owed_checks(rt.polymarket.cursor):
+            break
+        rt.polymarket.cursor["turn"] += 1
+    assert key in owed_checks(rt.polymarket.cursor)
+    rt.polymarket.cursor["turn"] += 1
+    for _ in range(3):
+        polymarket.tick(rt)
+        assert key in owed_checks(rt.polymarket.cursor)
+    refused = buy(rt, server, collateral_decision(rt), market="fake-2", price="0.05",
+                  slot="tool:1")
+    assert refused["error"] == polymarket.DRIFT_REFUSAL
+
+
 def test_a_resume_counts_the_polygon_allowance_as_spent():
     """Sol P2, round 5: a resumed pot's Polygon reader started with an empty window, so
     a world resumed within 10 s could send a second allowance."""
